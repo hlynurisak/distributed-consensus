@@ -1,6 +1,8 @@
-# Distributed Consensus
-CADP Programming Assignment 3 - Distributed Consensus  | Samhliða og dreifð forritun
----
+# Implementing the Raft consensus algorithm in Go.
+***Programming Assignment 3 "Distributed Consensus"*** \
+*Subject: CADP - Samhliða og dreifð forritun* \
+*Instructor: Marcel Kyaz*
+
 ## Authors: 
-### Hlynur Ísak Vilmundarson
-### Kacper Kaczynski
+*Hlynur Ísak Vilmundarson* \
+*Kacper Kaczynski*
