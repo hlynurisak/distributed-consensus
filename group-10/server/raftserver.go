@@ -14,7 +14,7 @@ import (
 func main() {
 	// Check command-line arguments: server identity and server configuration file.
 	if len(os.Args) != 3 {
-		fmt.Println("Usage: go run server.go server-host:server-port filename")
+		fmt.Println("Usage: go run raftserver.go server-host:server-port filename")
 		os.Exit(1)
 	}
 	selfID := os.Args[1]

@@ -12,7 +12,7 @@ import (
 func main() {
 	// Check command-line argument: server address to connect to.
 	if len(os.Args) != 2 {
-		fmt.Println("Usage: go run client.go server-host:server-port")
+		fmt.Println("Usage: go run raftclient.go server-host:server-port")
 		os.Exit(1)
 	}
 	serverAddr := os.Args[1]
