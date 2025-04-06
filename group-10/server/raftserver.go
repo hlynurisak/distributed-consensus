@@ -4,12 +4,15 @@ import (
 	"bufio"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mkyas/miniraft"
+	"google.golang.org/protobuf/proto"
 )
 
 // ServerState holds minimal state for this server.
@@ -24,10 +27,16 @@ type ServerState struct {
 	State       string // "Follower", "Candidate", "Leader", "Failed"
 }
 
-var serverState ServerState
+var (
+	serverState       ServerState
+	mu                sync.Mutex
+	candidateVotes    int
+	lastHeartbeat     time.Time   // Updated on valid heartbeat receipt.
+	electionStartTime time.Time   // Set when a candidate starts an election.
+)
 
 func main() {
-	// Check command-line arguments: server identity and server configuration file.
+	// Expect two arguments: our own identity and the config file.
 	if len(os.Args) != 3 {
 		fmt.Println("Usage: go run raftserver.go server-host:server-port filename")
 		os.Exit(1)
@@ -35,21 +44,19 @@ func main() {
 	selfID := os.Args[1]
 	configFile := os.Args[2]
 
-	// Load peer server addresses from config file.
+	// Load configuration.
 	peers, err := loadServerConfig(configFile)
 	if err != nil {
 		log.Fatalf("Failed to load server config: %v", err)
 	}
-
-	// Verify that the server's identity is in the config file.
 	if !contains(peers, selfID) {
 		log.Fatalf("Server identity %s not found in config file", selfID)
 	}
 
-	// Initialize Raft server state (term, log, state, commitIndex, etc.).
+	// Initialize server state.
 	initServerState(selfID, peers)
 
-	// Resolve own UDP address and start listening.
+	// Start listening on the specified UDP address.
 	addr, err := net.ResolveUDPAddr("udp", selfID)
 	if err != nil {
 		log.Fatalf("Failed to resolve address: %v", err)
@@ -63,16 +70,12 @@ func main() {
 	log.Printf("Server %s is up and listening.\n", selfID)
 	log.Printf("Configured peers: %v\n", peers)
 
-	// Start a goroutine to handle incoming UDP messages (from peers and clients).
+	// Start goroutines for message handling, initial handshake, and Raft protocol.
 	go handleUDPMessages(conn)
-
-	// Connect to other servers.
 	connectToPeers(peers, selfID)
-
-	// Start Raft protocol routines (e.g., leader election, heartbeat sender).
 	go runRaftProtocol()
 
-	// Command-line interface for debugging (log, print, resume, suspend, etc.)
+	// Simple CLI for debugging.
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print("Enter command (log, print, resume, suspend, exit): ")
@@ -84,23 +87,23 @@ func main() {
 		command := strings.TrimSpace(input)
 		switch command {
 		case "log":
-			// For demonstration, print the current log entries.
 			fmt.Println("Log entries:")
+			mu.Lock()
 			for _, entry := range serverState.LogEntries {
 				fmt.Printf("Term: %d, Index: %d, Command: %s\n", entry.Term, entry.Index, entry.CommandName)
 			}
+			mu.Unlock()
 		case "print":
-			// Print server state.
+			mu.Lock()
 			fmt.Printf("Current Term: %d\n", serverState.CurrentTerm)
 			fmt.Printf("Voted For: %s\n", serverState.VotedFor)
 			fmt.Printf("State: %s\n", serverState.State)
 			fmt.Printf("Commit Index: %d\n", serverState.CommitIndex)
 			fmt.Printf("Last Applied: %d\n", serverState.LastApplied)
+			mu.Unlock()
 		case "resume":
-			// Stub for resume.
 			fmt.Println("Resuming normal execution (stub).")
 		case "suspend":
-			// Stub for suspend.
 			fmt.Println("Suspending execution (stub).")
 		case "exit":
 			fmt.Println("Exiting.")
@@ -111,14 +114,13 @@ func main() {
 	}
 }
 
-// loadServerConfig reads a configuration file and returns a slice of server addresses.
+// loadServerConfig reads the configuration file.
 func loadServerConfig(filename string) ([]string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-
 	var servers []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -133,7 +135,7 @@ func loadServerConfig(filename string) ([]string, error) {
 	return servers, nil
 }
 
-// contains checks if a slice contains the specified string.
+// contains checks if an item is in a slice.
 func contains(slice []string, item string) bool {
 	for _, s := range slice {
 		if strings.TrimSpace(s) == strings.TrimSpace(item) {
@@ -143,8 +145,10 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-// initServerState initializes server variables such as current term, log, state, commitIndex, etc.
+// initServerState initializes our global server state.
 func initServerState(selfID string, peers []string) {
+	mu.Lock()
+	defer mu.Unlock()
 	serverState = ServerState{
 		SelfID:      selfID,
 		Peers:       peers,
@@ -155,10 +159,11 @@ func initServerState(selfID string, peers []string) {
 		LogEntries:  []miniraft.LogEntry{},
 		State:       "Follower",
 	}
+	lastHeartbeat = time.Now()
 	log.Println("Server state initialized.")
 }
 
-// handleUDPMessages continuously reads UDP messages and dispatches them for handling.
+// handleUDPMessages listens for incoming UDP packets.
 func handleUDPMessages(conn *net.UDPConn) {
 	buffer := make([]byte, 65536)
 	for {
@@ -168,41 +173,54 @@ func handleUDPMessages(conn *net.UDPConn) {
 			continue
 		}
 		data := buffer[:n]
-		log.Printf("Received %d bytes from %s: %s\n", n, addr.String(), strings.TrimSpace(string(data)))
 
-		// TODO: Unmarshal the protobuf Raft message and handle it.
-		// Example:
-		// var raftMsg miniraft.Raft
-		// if err := proto.Unmarshal(data, &raftMsg); err != nil {
-		//     log.Printf("Failed to unmarshal message: %v", err)
-		// } else {
-		//     if raftMsg.AppendEntriesRequest != nil {
-		//         handleAppendEntries(&raftMsg)
-		//     } else if raftMsg.RequestVoteRequest != nil {
-		//         handleRequestVote(&raftMsg)
-		//     } else {
-		//         log.Printf("Unknown message type")
-		//     }
-		// }
+		// Filter out plain-text handshake messages.
+		if strings.HasPrefix(string(data), "handshake from") {
+			log.Printf("Received handshake from %s: %s", addr.String(), strings.TrimSpace(string(data)))
+			// Update heartbeat timer.
+			mu.Lock()
+			lastHeartbeat = time.Now()
+			mu.Unlock()
+			continue
+		}
+
+		var raftMsg miniraft.Raft
+		err = proto.Unmarshal(data, &raftMsg)
+		if err != nil {
+			log.Printf("Failed to unmarshal message: %v", err)
+			continue
+		}
+
+		switch {
+		case raftMsg.GetRequestVoteRequest() != nil:
+			go handleRequestVote(raftMsg.GetRequestVoteRequest(), addr)
+		case raftMsg.GetRequestVoteResponse() != nil:
+			go handleRequestVoteResponse(raftMsg.GetRequestVoteResponse())
+		case raftMsg.GetAppendEntriesRequest() != nil:
+			go handleAppendEntries(raftMsg.GetAppendEntriesRequest(), addr)
+		case raftMsg.GetAppendEntriesResponse() != nil:
+			// Optionally handle AppendEntries responses.
+		case raftMsg.GetCommandName() != "":
+			log.Printf("Received command: %s", raftMsg.GetCommandName())
+		default:
+			log.Printf("Unknown message type")
+		}
 	}
 }
 
-// connectToPeers sends initial messages to other servers to establish connections.
+// connectToPeers sends an initial handshake to each peer.
 func connectToPeers(peers []string, selfID string) {
 	for _, peer := range peers {
 		if strings.TrimSpace(peer) == strings.TrimSpace(selfID) {
 			continue
 		}
-		// Resolve UDP address of the peer.
-		peerAddr, err := net.ResolveUDPAddr("udp", peer)
+		addr, err := net.ResolveUDPAddr("udp", peer)
 		if err != nil {
 			log.Printf("Failed to resolve address for peer %s: %v", peer, err)
 			continue
 		}
-		// For Milestone 1, log the connection attempt.
-		log.Printf("Connecting to peer %s at %s\n", peer, peerAddr.String())
-		// Optionally, send a simple handshake message.
-		conn, err := net.DialUDP("udp", nil, peerAddr)
+		log.Printf("Connecting to peer %s at %s", peer, addr.String())
+		conn, err := net.DialUDP("udp", nil, addr)
 		if err != nil {
 			log.Printf("Failed to dial peer %s: %v", peer, err)
 			continue
@@ -216,31 +234,240 @@ func connectToPeers(peers []string, selfID string) {
 	}
 }
 
-// runRaftProtocol manages state transitions (Follower, Candidate, Leader, Failed)
-// and implements core Raft logic. For Milestone 1, this is a stub.
+// runRaftProtocol handles election timeouts and heartbeat sending.
 func runRaftProtocol() {
-	log.Println("Raft protocol routine started (stub).")
+	rand.Seed(time.Now().UnixNano())
+	// Use a randomized election timeout for followers (1500ms to 3000ms).
+	electionTimeout := time.Duration(1500+rand.Intn(1500)) * time.Millisecond
 	for {
-		// In a full implementation, you'd handle timeouts, elections, and heartbeats.
-		time.Sleep(5 * time.Second)
-		log.Println("Raft protocol running (stub).")
+		mu.Lock()
+		state := serverState.State
+		timeSinceHB := time.Since(lastHeartbeat)
+		mu.Unlock()
+
+		// Follower: If no heartbeat received within the timeout, start an election.
+		if state == "Follower" && timeSinceHB >= electionTimeout {
+			mu.Lock()
+			startElection()
+			electionStartTime = time.Now()
+			lastHeartbeat = time.Now()
+			mu.Unlock()
+			// Choose a new randomized timeout.
+			electionTimeout = time.Duration(1500+rand.Intn(1500)) * time.Millisecond
+		} else if state == "Candidate" {
+			// In Candidate mode, wait longer (2 seconds) for responses before restarting election.
+			if time.Since(electionStartTime) >= 2*time.Second {
+				mu.Lock()
+				log.Printf("Candidate %s restarting election (term %d)", serverState.SelfID, serverState.CurrentTerm)
+				startElection()
+				electionStartTime = time.Now()
+				mu.Unlock()
+			}
+			time.Sleep(50 * time.Millisecond)
+		} else if state == "Leader" {
+			sendHeartbeats()
+			time.Sleep(100 * time.Millisecond)
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
 }
 
-// handleAppendEntries handles incoming AppendEntries RPC messages.
-func handleAppendEntries(msg *miniraft.Raft) {
-	// TODO: Process the AppendEntriesRequest according to the Raft protocol.
-	log.Println("handleAppendEntries called (stub).")
+// startElection sets our state to Candidate, increments term, votes for self,
+// and sends RequestVote RPCs to all peers.
+func startElection() {
+	serverState.State = "Candidate"
+	serverState.CurrentTerm++
+	serverState.VotedFor = serverState.SelfID
+	candidateVotes = 1 // Vote for self.
+	log.Printf("Starting election for term %d", serverState.CurrentTerm)
+	for _, peer := range serverState.Peers {
+		if strings.TrimSpace(peer) == serverState.SelfID {
+			continue
+		}
+		go sendRequestVote(peer, serverState.CurrentTerm)
+	}
 }
 
-// handleRequestVote handles incoming RequestVote RPC messages.
-func handleRequestVote(msg *miniraft.Raft) {
-	// TODO: Process the RequestVoteRequest and update server vote state.
-	log.Println("handleRequestVote called (stub).")
+// sendRequestVote sends a RequestVote RPC to a given peer.
+func sendRequestVote(peer string, term uint64) {
+	addr, err := net.ResolveUDPAddr("udp", peer)
+	if err != nil {
+		log.Printf("Failed to resolve peer address %s: %v", peer, err)
+		return
+	}
+	req := &miniraft.Raft{
+		Message: &miniraft.Raft_RequestVoteRequest{
+			RequestVoteRequest: &miniraft.RequestVoteRequest{
+				Term:          term,
+				LastLogIndex:  0, // Simplified: no log entries yet.
+				LastLogTerm:   0,
+				CandidateName: serverState.SelfID,
+			},
+		},
+	}
+	data, err := proto.Marshal(req)
+	if err != nil {
+		log.Printf("Error marshaling RequestVote: %v", err)
+		return
+	}
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		log.Printf("Failed to dial peer %s: %v", peer, err)
+		return
+	}
+	defer conn.Close()
+	_, err = conn.Write(data)
+	if err != nil {
+		log.Printf("Error sending RequestVote to %s: %v", peer, err)
+	}
 }
 
-// processClientCommand processes client commands (e.g., insert, select, update).
-func processClientCommand(command string) {
-	// TODO: Validate and log the command. If not the leader, buffer or redirect the command.
-	log.Printf("Processing client command: %s (stub)\n", command)
+// handleRequestVote processes an incoming RequestVote RPC.
+func handleRequestVote(req *miniraft.RequestVoteRequest, addr *net.UDPAddr) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Reject if candidate's term is less than our term.
+	if req.Term < serverState.CurrentTerm {
+		sendRequestVoteResponse(addr, false)
+		return
+	}
+
+	// If candidate's term is higher, update our term and revert to follower.
+	if req.Term > serverState.CurrentTerm {
+		serverState.CurrentTerm = req.Term
+		serverState.State = "Follower"
+		serverState.VotedFor = ""
+	}
+
+	// Grant vote if we haven't voted yet or have already voted for this candidate.
+	if serverState.VotedFor == "" || serverState.VotedFor == req.CandidateName {
+		serverState.VotedFor = req.CandidateName
+		sendRequestVoteResponse(addr, true)
+	} else {
+		sendRequestVoteResponse(addr, false)
+	}
+}
+
+// sendRequestVoteResponse sends a response for a RequestVote RPC.
+func sendRequestVoteResponse(addr *net.UDPAddr, voteGranted bool) {
+	resp := &miniraft.Raft{
+		Message: &miniraft.Raft_RequestVoteResponse{
+			RequestVoteResponse: &miniraft.RequestVoteResponse{
+				Term:        serverState.CurrentTerm,
+				VoteGranted: voteGranted,
+			},
+		},
+	}
+	data, err := proto.Marshal(resp)
+	if err != nil {
+		log.Printf("Error marshaling RequestVoteResponse: %v", err)
+		return
+	}
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		log.Printf("Error dialing for RequestVoteResponse: %v", err)
+		return
+	}
+	defer conn.Close()
+	_, err = conn.Write(data)
+	if err != nil {
+		log.Printf("Error sending RequestVoteResponse: %v", err)
+	}
+}
+
+// handleRequestVoteResponse processes a vote response.
+func handleRequestVoteResponse(resp *miniraft.RequestVoteResponse) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	// If the response's term is greater, update our term and revert to follower.
+	if resp.Term > serverState.CurrentTerm {
+		serverState.CurrentTerm = resp.Term
+		serverState.State = "Follower"
+		serverState.VotedFor = ""
+		return
+	}
+	// If we're still a candidate in the current term, count the vote.
+	if serverState.State == "Candidate" && resp.Term == serverState.CurrentTerm {
+		if resp.VoteGranted {
+			candidateVotes++
+			log.Printf("Candidate %s received vote, total votes: %d", serverState.SelfID, candidateVotes)
+			// With three nodes, majority is 2 votes.
+			if candidateVotes > len(serverState.Peers)/2 {
+				serverState.State = "Leader"
+				log.Printf("Server %s elected as Leader for term %d", serverState.SelfID, serverState.CurrentTerm)
+			}
+		}
+	}
+}
+
+// sendHeartbeats sends an AppendEntries (heartbeat) RPC to all peers.
+func sendHeartbeats() {
+	mu.Lock()
+	term := serverState.CurrentTerm
+	leaderID := serverState.SelfID
+	commitIndex := serverState.CommitIndex
+	mu.Unlock()
+
+	for _, peer := range serverState.Peers {
+		if strings.TrimSpace(peer) == leaderID {
+			continue
+		}
+		go func(peer string) {
+			addr, err := net.ResolveUDPAddr("udp", peer)
+			if err != nil {
+				log.Printf("Failed to resolve peer address %s: %v", peer, err)
+				return
+			}
+			req := &miniraft.Raft{
+				Message: &miniraft.Raft_AppendEntriesRequest{
+					AppendEntriesRequest: &miniraft.AppendEntriesRequest{
+						Term:         term,
+						PrevLogIndex: 0,
+						PrevLogTerm:  0,
+						LeaderCommit: commitIndex,
+						LeaderId:     leaderID,
+						Entries:      []*miniraft.LogEntry{}, // empty heartbeat
+					},
+				},
+			}
+			data, err := proto.Marshal(req)
+			if err != nil {
+				log.Printf("Error marshaling heartbeat: %v", err)
+				return
+			}
+			conn, err := net.DialUDP("udp", nil, addr)
+			if err != nil {
+				log.Printf("Failed to dial peer %s: %v", peer, err)
+				return
+			}
+			defer conn.Close()
+			_, err = conn.Write(data)
+			if err != nil {
+				log.Printf("Error sending heartbeat to %s: %v", peer, err)
+			}
+		}(peer)
+	}
+}
+
+// handleAppendEntries processes an AppendEntries (heartbeat) RPC.
+func handleAppendEntries(req *miniraft.AppendEntriesRequest, addr *net.UDPAddr) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Ignore if the leader's term is less than our term.
+	if req.Term < serverState.CurrentTerm {
+		return
+	}
+	// If leader's term is higher, update our term and revert to follower.
+	if req.Term > serverState.CurrentTerm {
+		serverState.CurrentTerm = req.Term
+		serverState.State = "Follower"
+		serverState.VotedFor = ""
+	}
+	// Reset our heartbeat timer.
+	lastHeartbeat = time.Now()
+	log.Printf("Received heartbeat from leader %s", req.LeaderId)
 }
