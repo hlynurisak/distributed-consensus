@@ -24,7 +24,7 @@ type ServerState struct {
 	CommitIndex uint64
 	LastApplied uint64
 	LogEntries  []miniraft.LogEntry
-	State       string // "Follower", "Candidate", "Leader", "Failed"
+	State       string // Can be "Follower", "Candidate", "Leader", "Failed"
 	
 	// To track peers
 	NextIndex   map[string]uint64
@@ -38,12 +38,11 @@ var (
 	candidateVotes    int
 	lastHeartbeat     time.Time      // Updated on valid heartbeat receipt.
 	electionStartTime time.Time      // Set when a candidate starts an election.
-	debugMode         bool = true    // Enable/disable detailed logging
 )
 
 // Constants for Raft protocol timing
 const (
-	// Base election timeout between 150-300ms as per Raft paper recommendation
+	// Base election timeout between 150-300ms as per Raft paper recommendation (section 5.1)
 	minElectionTimeout = 150 * time.Millisecond
 	maxElectionTimeout = 300 * time.Millisecond
 	
@@ -94,10 +93,10 @@ func main() {
 	connectToPeers(peers, selfID)
 	go runRaftProtocol()
 
-	// Simple CLI for debugging.
+	// Simple CLI
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Print("Enter command (log, print, resume, suspend, debug, exit): ")
+		fmt.Print("Enter command (log, print, resume, suspend, exit): ")
 		input, err := reader.ReadString('\n')
 		if err != nil {
 			log.Printf("Error reading input: %v", err)
@@ -136,9 +135,6 @@ func main() {
 			serverState.State = "Failed"
 			fmt.Println("Server suspended. Enter 'resume' to continue.")
 			mu.Unlock()
-		case "debug":
-			debugMode = !debugMode
-			fmt.Printf("Debug mode: %v\n", debugMode)
 		case "exit":
 			fmt.Println("Exiting.")
 			return
@@ -301,10 +297,6 @@ func runRaftProtocol() {
 			// If no heartbeat received within the timeout, start an election.
 			if timeSinceLast >= electionTimeout {
 				mu.Lock()
-				if debugMode {
-					log.Printf("Follower %s timed out after %v, starting election", 
-						serverState.SelfID, timeSinceLast)
-				}
 				startElection()
 				electionStartTime = time.Now()
 				mu.Unlock()
@@ -318,10 +310,6 @@ func runRaftProtocol() {
 			// Candidate: Timeout if election takes too long
 			if time.Since(electionStartTime) >= electionTimeout {
 				mu.Lock()
-				if debugMode {
-					log.Printf("Candidate %s election timed out after %v, restarting election (term %d)", 
-						serverState.SelfID, time.Since(electionStartTime), serverState.CurrentTerm)
-				}
 				startElection()
 				electionStartTime = time.Now()
 				mu.Unlock()
@@ -415,8 +403,6 @@ func sendRequestVote(peer string, candidateID string) {
 	_, err = conn.Write(data)
 	if err != nil {
 		log.Printf("Error sending RequestVote to %s: %v", peer, err)
-	} else if debugMode {
-		log.Printf("Sent RequestVote to %s for term %d", peer, term)
 	}
 }
 
@@ -429,10 +415,6 @@ func handleRequestVote(req *miniraft.RequestVoteRequest, addr *net.UDPAddr) {
 	
 	// Step down if the term is higher
 	if req.Term > serverState.CurrentTerm {
-		if debugMode {
-			log.Printf("RequestVote: Stepping down from %s to follower due to higher term %d > %d", 
-				serverState.State, req.Term, serverState.CurrentTerm)
-		}
 		serverState.CurrentTerm = req.Term
 		serverState.State = "Follower"
 		serverState.VotedFor = ""
@@ -440,10 +422,6 @@ func handleRequestVote(req *miniraft.RequestVoteRequest, addr *net.UDPAddr) {
 
 	// Reject if candidate's term is less than self
 	if req.Term < serverState.CurrentTerm {
-		if debugMode {
-			log.Printf("RequestVote: Rejecting vote to %s - lower term %d < %d", 
-				req.CandidateName, req.Term, serverState.CurrentTerm)
-		}
 		sendRequestVoteResponse(addr, false, serverState.CurrentTerm)
 		return
 	}
@@ -465,18 +443,8 @@ func handleRequestVote(req *miniraft.RequestVoteRequest, addr *net.UDPAddr) {
 			(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= lastLogIndex) {
 			serverState.VotedFor = req.CandidateName
 			voteGranted = true
-			lastHeartbeat = time.Now() // Reset election timer if vote is given
-			
-			if debugMode {
-				log.Printf("RequestVote: Granting vote to %s for term %d", 
-					req.CandidateName, req.Term)
-			}
-		} else if debugMode {
-			log.Printf("RequestVote: Rejecting vote to %s - log not up-to-date", req.CandidateName)
+			lastHeartbeat = time.Now() // Reset election timer if vote is given	
 		}
-	} else if debugMode {
-		log.Printf("RequestVote: Already voted for %s in term %d", 
-			serverState.VotedFor, serverState.CurrentTerm)
 	}
 	
 	sendRequestVoteResponse(addr, voteGranted, serverState.CurrentTerm)
@@ -520,10 +488,6 @@ func handleRequestVoteResponse(resp *miniraft.RequestVoteResponse) {
 
 	// If term in response is greater then update term and set state to follower
 	if resp.Term > serverState.CurrentTerm {
-		if debugMode {
-			log.Printf("Vote response: Stepping down to follower due to higher term %d > %d", 
-				resp.Term, serverState.CurrentTerm)
-		}
 		serverState.CurrentTerm = resp.Term
 		serverState.State = "Follower"
 		serverState.VotedFor = ""
@@ -648,8 +612,6 @@ func sendAppendEntries(peer string, term uint64, leaderID string, commitIndex ui
 	_, err = conn.Write(data)
 	if err != nil {
 		log.Printf("Error sending AppendEntries to %s: %v", peer, err)
-	} else if len(entries) > 0 && debugMode {
-		log.Printf("Sent %d log entries to %s", len(entries), peer)
 	}
 }
 
@@ -663,10 +625,6 @@ func handleAppendEntries(req *miniraft.AppendEntriesRequest, addr *net.UDPAddr) 
 	
 	// Reject if leaders term is less than self
 	if req.Term < serverState.CurrentTerm {
-		if debugMode {
-			log.Printf("AppendEntries: Rejecting from %s - lower term %d < %d", 
-				req.LeaderId, req.Term, serverState.CurrentTerm)
-		}
 		mu.Unlock()
 		sendAppendEntriesResponse(addr, false, serverState.CurrentTerm)
 		return
@@ -674,12 +632,7 @@ func handleAppendEntries(req *miniraft.AppendEntriesRequest, addr *net.UDPAddr) 
 	
 	// If term is greater or equal, update state to follower
 	if req.Term >= serverState.CurrentTerm {
-		wasLeader := serverState.State == "Leader"
 		if req.Term > serverState.CurrentTerm || serverState.State != "Follower" {
-			if debugMode && (wasLeader || serverState.State == "Candidate") {
-				log.Printf("AppendEntries: %s stepping down to follower due to term %d >= %d", 
-					serverState.State, req.Term, serverState.CurrentTerm)
-			}
 			serverState.CurrentTerm = req.Term
 			serverState.State = "Follower"
 			serverState.VotedFor = ""
@@ -703,9 +656,6 @@ func handleAppendEntries(req *miniraft.AppendEntriesRequest, addr *net.UDPAddr) 
 		if !logOK {
 			// Log inconsistency, reject
 			// The Raft paper section 5.3
-			if debugMode {
-				log.Printf("AppendEntries: Log inconsistency at index %d", req.PrevLogIndex)
-			}
 			mu.Unlock()
 			sendAppendEntriesResponse(addr, false, serverState.CurrentTerm)
 			return
@@ -733,10 +683,6 @@ func handleAppendEntries(req *miniraft.AppendEntriesRequest, addr *net.UDPAddr) 
 					Term:        entry.Term,
 					CommandName: entry.CommandName,
 				})
-				if debugMode {
-					log.Printf("AppendEntries: Added entry %d: %s", 
-						entry.Index, entry.CommandName)
-				}
 			}
 		}
 		
@@ -759,10 +705,6 @@ func handleAppendEntries(req *miniraft.AppendEntriesRequest, addr *net.UDPAddr) 
 			serverState.CommitIndex = req.LeaderCommit
 		} else {
 			serverState.CommitIndex = lastLogIndex
-		}
-		
-		if debugMode {
-			log.Printf("AppendEntries: Updated commit index to %d", serverState.CommitIndex)
 		}
 		
 		// Apply committed entries
@@ -817,10 +759,6 @@ func handleAppendEntriesResponse(resp *miniraft.AppendEntriesResponse, addr *net
 	
 	// If term in response is greater than self - update term and set state to follower
 	if resp.Term > serverState.CurrentTerm {
-		if debugMode {
-			log.Printf("AppendEntries response: Stepping down to follower due to higher term %d > %d", 
-				resp.Term, serverState.CurrentTerm)
-		}
 		serverState.CurrentTerm = resp.Term
 		serverState.State = "Follower"
 		serverState.VotedFor = ""
@@ -855,10 +793,6 @@ func handleAppendEntriesResponse(resp *miniraft.AppendEntriesResponse, addr *net
 		
 		// Update indexes for peer
 		if lastSentIndex >= serverState.NextIndex[peerID] {
-			if debugMode {
-				log.Printf("AppendEntries response: Peer %s successfully replicated up to index %d", 
-					peerID, lastSentIndex)
-			}
 			serverState.NextIndex[peerID] = lastSentIndex + 1
 			serverState.MatchIndex[peerID] = lastSentIndex
 			
@@ -869,10 +803,6 @@ func handleAppendEntriesResponse(resp *miniraft.AppendEntriesResponse, addr *net
 		// If failed due to log inconsistency, decrement nextIndex and retry
 		if serverState.NextIndex[peerID] > 1 {
 			serverState.NextIndex[peerID]--
-			if debugMode {
-				log.Printf("AppendEntries response: Peer %s rejected append, decreasing nextIndex to %d", 
-					peerID, serverState.NextIndex[peerID])
-			}
 			// Will be retried on next heartbeat automatically
 		}
 	}
@@ -897,10 +827,6 @@ func updateCommitIndex() {
 			
 			// If majority, commit entry
 			if replicationCount > len(serverState.Peers)/2 {
-				if debugMode {
-					log.Printf("Leader %s: Committing entry at index %d (replicated on %d/%d servers)", 
-						serverState.SelfID, N, replicationCount, len(serverState.Peers)) 
-				}
 				serverState.CommitIndex = N
 			} else {
 				break
