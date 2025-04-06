@@ -15,7 +15,6 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ServerState holds minimal state for this server.
 type ServerState struct {
 	SelfID      string
 	Peers       []string
@@ -36,7 +35,7 @@ var (
 	serverState       ServerState
 	mu                sync.Mutex
 	candidateVotes    int
-	lastHeartbeat     time.Time      // Updated on valid heartbeat receipt.
+	lastHeartbeat     time.Time      // Updated on valid heartbeat 
 	electionStartTime time.Time      // Set when a candidate starts an election.
 )
 
