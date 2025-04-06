@@ -1,3 +1,5 @@
+// CODE TO BE FIXED BY CLAUDE
+
 package main
 
 import (
@@ -14,6 +16,8 @@ import (
 	"github.com/mkyas/miniraft"
 	"google.golang.org/protobuf/proto"
 )
+
+var candidateTimeout time.Duration
 
 // ServerState holds minimal state for this server.
 type ServerState struct {
@@ -36,7 +40,7 @@ var (
 )
 
 func main() {
-	// Expect two arguments: our own identity and the config file.
+	// Expect two arguments: ip:port and config file.
 	if len(os.Args) != 3 {
 		fmt.Println("Usage: go run raftserver.go server-host:server-port filename")
 		os.Exit(1)
@@ -44,7 +48,7 @@ func main() {
 	selfID := os.Args[1]
 	configFile := os.Args[2]
 
-	// Load configuration.
+	// Load server configuration.
 	peers, err := loadServerConfig(configFile)
 	if err != nil {
 		log.Fatalf("Failed to load server config: %v", err)
@@ -56,7 +60,7 @@ func main() {
 	// Initialize server state.
 	initServerState(selfID, peers)
 
-	// Start listening on the specified UDP address.
+	// Start listening on the specified address.
 	addr, err := net.ResolveUDPAddr("udp", selfID)
 	if err != nil {
 		log.Fatalf("Failed to resolve address: %v", err)
@@ -89,7 +93,8 @@ func main() {
 		case "log":
 			fmt.Println("Log entries:")
 			mu.Lock()
-			for _, entry := range serverState.LogEntries {
+			for i := range serverState.LogEntries {
+				entry := &serverState.LogEntries[i]
 				fmt.Printf("Term: %d, Index: %d, Command: %s\n", entry.Term, entry.Index, entry.CommandName)
 			}
 			mu.Unlock()
@@ -145,7 +150,7 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-// initServerState initializes our global server state.
+// Initialize the global server state.
 func initServerState(selfID string, peers []string) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -236,9 +241,8 @@ func connectToPeers(peers []string, selfID string) {
 
 // runRaftProtocol handles election timeouts and heartbeat sending.
 func runRaftProtocol() {
-	rand.Seed(time.Now().UnixNano())
 	// Use a randomized election timeout for followers (1500ms to 3000ms).
-	electionTimeout := time.Duration(1500+rand.Intn(1500)) * time.Millisecond
+	electionTimeout := time.Duration(3500+rand.Intn(1500)) * time.Millisecond
 	for {
 		mu.Lock()
 		state := serverState.State
@@ -250,17 +254,18 @@ func runRaftProtocol() {
 			mu.Lock()
 			startElection()
 			electionStartTime = time.Now()
-			lastHeartbeat = time.Now()
+			// Initialize candidateTimeout when first transitioning.
+			candidateTimeout = time.Duration(3500+rand.Intn(1500)) * time.Millisecond
 			mu.Unlock()
-			// Choose a new randomized timeout.
-			electionTimeout = time.Duration(1500+rand.Intn(1500)) * time.Millisecond
+			// Choose a new randomized follower timeout.
+			electionTimeout = time.Duration(3500+rand.Intn(1500)) * time.Millisecond
 		} else if state == "Candidate" {
-			// In Candidate mode, wait longer (2 seconds) for responses before restarting election.
-			if time.Since(electionStartTime) >= 2*time.Second {
+			if time.Since(electionStartTime) >= candidateTimeout {
 				mu.Lock()
 				log.Printf("Candidate %s restarting election (term %d)", serverState.SelfID, serverState.CurrentTerm)
 				startElection()
 				electionStartTime = time.Now()
+				candidateTimeout = time.Duration(3500+rand.Intn(1500)) * time.Millisecond
 				mu.Unlock()
 			}
 			time.Sleep(50 * time.Millisecond)
