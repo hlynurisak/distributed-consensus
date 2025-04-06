@@ -3,6 +3,3 @@ localhost:2001
 localhost:2002
 localhost:2003
 localhost:2004
-localhost:2005
-localhost:2006
-localhost:2007

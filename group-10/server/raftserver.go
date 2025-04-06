@@ -1,5 +1,3 @@
-// CODE TO BE FIXED BY CLAUDE
-
 package main
 
 import (
@@ -17,8 +15,6 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var candidateTimeout time.Duration
-
 // ServerState holds minimal state for this server.
 type ServerState struct {
 	SelfID      string
@@ -29,17 +25,36 @@ type ServerState struct {
 	LastApplied uint64
 	LogEntries  []miniraft.LogEntry
 	State       string // "Follower", "Candidate", "Leader", "Failed"
+	
+	// To track peers
+	NextIndex   map[string]uint64
+	MatchIndex  map[string]uint64
 }
 
+// Global variables
 var (
 	serverState       ServerState
 	mu                sync.Mutex
 	candidateVotes    int
-	lastHeartbeat     time.Time   // Updated on valid heartbeat receipt.
-	electionStartTime time.Time   // Set when a candidate starts an election.
+	lastHeartbeat     time.Time      // Updated on valid heartbeat receipt.
+	electionStartTime time.Time      // Set when a candidate starts an election.
+	debugMode         bool = true    // Enable/disable detailed logging
+)
+
+// Constants for Raft protocol timing
+const (
+	// Base election timeout between 150-300ms as per Raft paper recommendation
+	minElectionTimeout = 150 * time.Millisecond
+	maxElectionTimeout = 300 * time.Millisecond
+	
+	// Heartbeat interval (should be less than minElectionTimeout)
+	heartbeatInterval = 50 * time.Millisecond
 )
 
 func main() {
+	// Seed the random number generator
+	rand.Seed(time.Now().UnixNano())
+	
 	// Expect two arguments: ip:port and config file.
 	if len(os.Args) != 3 {
 		fmt.Println("Usage: go run raftserver.go server-host:server-port filename")
@@ -82,7 +97,7 @@ func main() {
 	// Simple CLI for debugging.
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Print("Enter command (log, print, resume, suspend, exit): ")
+		fmt.Print("Enter command (log, print, resume, suspend, debug, exit): ")
 		input, err := reader.ReadString('\n')
 		if err != nil {
 			log.Printf("Error reading input: %v", err)
@@ -105,11 +120,25 @@ func main() {
 			fmt.Printf("State: %s\n", serverState.State)
 			fmt.Printf("Commit Index: %d\n", serverState.CommitIndex)
 			fmt.Printf("Last Applied: %d\n", serverState.LastApplied)
+			fmt.Printf("Time since last heartbeat: %v\n", time.Since(lastHeartbeat))
 			mu.Unlock()
 		case "resume":
-			fmt.Println("Resuming normal execution (stub).")
+			mu.Lock()
+			if serverState.State == "Failed" {
+				serverState.State = "Follower"
+				fmt.Println("Resuming as follower.")
+			} else {
+				fmt.Println("Server is already running.")
+			}
+			mu.Unlock()
 		case "suspend":
-			fmt.Println("Suspending execution (stub).")
+			mu.Lock()
+			serverState.State = "Failed"
+			fmt.Println("Server suspended. Enter 'resume' to continue.")
+			mu.Unlock()
+		case "debug":
+			debugMode = !debugMode
+			fmt.Printf("Debug mode: %v\n", debugMode)
 		case "exit":
 			fmt.Println("Exiting.")
 			return
@@ -119,7 +148,8 @@ func main() {
 	}
 }
 
-// loadServerConfig reads the configuration file.
+// Parse and load the config file.
+// https://stackoverflow.com/questions/8757389/reading-a-file-line-by-line-in-go
 func loadServerConfig(filename string) ([]string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -140,7 +170,7 @@ func loadServerConfig(filename string) ([]string, error) {
 	return servers, nil
 }
 
-// contains checks if an item is in a slice.
+// Check if an item is in a slice.
 func contains(slice []string, item string) bool {
 	for _, s := range slice {
 		if strings.TrimSpace(s) == strings.TrimSpace(item) {
@@ -154,6 +184,19 @@ func contains(slice []string, item string) bool {
 func initServerState(selfID string, peers []string) {
 	mu.Lock()
 	defer mu.Unlock()
+	
+	// Initialize next and match indices for leader state
+	nextIndex := make(map[string]uint64)
+	// The highest index known to be commited
+	matchIndex := make(map[string]uint64)
+	
+	for _, peer := range peers {
+		if peer != selfID {
+			nextIndex[peer] = 1  // Raft indexing starts at 1
+			matchIndex[peer] = 0
+		}
+	}
+	
 	serverState = ServerState{
 		SelfID:      selfID,
 		Peers:       peers,
@@ -163,13 +206,16 @@ func initServerState(selfID string, peers []string) {
 		LastApplied: 0,
 		LogEntries:  []miniraft.LogEntry{},
 		State:       "Follower",
+		NextIndex:   nextIndex,
+		MatchIndex:  matchIndex,
 	}
 	lastHeartbeat = time.Now()
 	log.Println("Server state initialized.")
 }
 
-// handleUDPMessages listens for incoming UDP packets.
+// Listen for incoming UDP packets.
 func handleUDPMessages(conn *net.UDPConn) {
+	// 64kB buffer
 	buffer := make([]byte, 65536)
 	for {
 		n, addr, err := conn.ReadFromUDP(buffer)
@@ -204,16 +250,16 @@ func handleUDPMessages(conn *net.UDPConn) {
 		case raftMsg.GetAppendEntriesRequest() != nil:
 			go handleAppendEntries(raftMsg.GetAppendEntriesRequest(), addr)
 		case raftMsg.GetAppendEntriesResponse() != nil:
-			// Optionally handle AppendEntries responses.
+			go handleAppendEntriesResponse(raftMsg.GetAppendEntriesResponse(), addr)
 		case raftMsg.GetCommandName() != "":
-			log.Printf("Received command: %s", raftMsg.GetCommandName())
+			go handleClientCommand(raftMsg.GetCommandName())
 		default:
 			log.Printf("Unknown message type")
 		}
 	}
 }
 
-// connectToPeers sends an initial handshake to each peer.
+// Send a handshake to each peer in the network.
 func connectToPeers(peers []string, selfID string) {
 	for _, peer := range peers {
 		if strings.TrimSpace(peer) == strings.TrimSpace(selfID) {
@@ -239,75 +285,119 @@ func connectToPeers(peers []string, selfID string) {
 	}
 }
 
-// runRaftProtocol handles election timeouts and heartbeat sending.
+// The main loop. Handles election timeouts and sending out the heartbeats.
 func runRaftProtocol() {
-	// Use a randomized election timeout for followers (1500ms to 3000ms).
-	electionTimeout := time.Duration(3500+rand.Intn(1500)) * time.Millisecond
+	// Get initial randomized election timeout
+	electionTimeout := getRandomElectionTimeout()
+	
 	for {
 		mu.Lock()
 		state := serverState.State
-		timeSinceHB := time.Since(lastHeartbeat)
+		timeSinceLast := time.Since(lastHeartbeat)
 		mu.Unlock()
 
-		// Follower: If no heartbeat received within the timeout, start an election.
-		if state == "Follower" && timeSinceHB >= electionTimeout {
-			mu.Lock()
-			startElection()
-			electionStartTime = time.Now()
-			// Initialize candidateTimeout when first transitioning.
-			candidateTimeout = time.Duration(3500+rand.Intn(1500)) * time.Millisecond
-			mu.Unlock()
-			// Choose a new randomized follower timeout.
-			electionTimeout = time.Duration(3500+rand.Intn(1500)) * time.Millisecond
-		} else if state == "Candidate" {
-			if time.Since(electionStartTime) >= candidateTimeout {
+		switch state {
+		case "Follower":
+			// If no heartbeat received within the timeout, start an election.
+			if timeSinceLast >= electionTimeout {
 				mu.Lock()
-				log.Printf("Candidate %s restarting election (term %d)", serverState.SelfID, serverState.CurrentTerm)
+				if debugMode {
+					log.Printf("Follower %s timed out after %v, starting election", 
+						serverState.SelfID, timeSinceLast)
+				}
 				startElection()
 				electionStartTime = time.Now()
-				candidateTimeout = time.Duration(3500+rand.Intn(1500)) * time.Millisecond
 				mu.Unlock()
+				
 			}
-			time.Sleep(50 * time.Millisecond)
-		} else if state == "Leader" {
+			// Get new random timeout for next cycle and sleep a little
+			electionTimeout = getRandomElectionTimeout()
+			time.Sleep(10 * time.Millisecond)
+			
+		case "Candidate":
+			// Candidate: Timeout if election takes too long
+			if time.Since(electionStartTime) >= electionTimeout {
+				mu.Lock()
+				if debugMode {
+					log.Printf("Candidate %s election timed out after %v, restarting election (term %d)", 
+						serverState.SelfID, time.Since(electionStartTime), serverState.CurrentTerm)
+				}
+				startElection()
+				electionStartTime = time.Now()
+				mu.Unlock()
+				
+			}
+			// Choose a new randomized timeout for next cycle
+			electionTimeout = getRandomElectionTimeout()
+			time.Sleep(10 * time.Millisecond)
+			
+		case "Leader":
+			// Leader: Send heartbeats periodically
 			sendHeartbeats()
+			time.Sleep(heartbeatInterval)
+			
+		case "Failed":
+			// Do nothing if server is in failed state
 			time.Sleep(100 * time.Millisecond)
-		} else {
+			
+		default:
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
 }
 
-// startElection sets our state to Candidate, increments term, votes for self,
-// and sends RequestVote RPCs to all peers.
+// Get a random election timeout within the specified min and max timeouts.
+func getRandomElectionTimeout() time.Duration {
+	return minElectionTimeout + time.Duration(rand.Int63n(int64(maxElectionTimeout-minElectionTimeout)))
+}
+
+// startElection sets state to Candidate, increments term, votes for self 
+// and ask the others to vote for me aswell (RequestVote RPC).
 func startElection() {
 	serverState.State = "Candidate"
 	serverState.CurrentTerm++
 	serverState.VotedFor = serverState.SelfID
-	candidateVotes = 1 // Vote for self.
+	candidateVotes = 1 // 1 vote from self
+	lastHeartbeat = time.Now() // Reset heartbeat timer
+	electionStartTime = time.Now() // Reset election start time
 	log.Printf("Starting election for term %d", serverState.CurrentTerm)
+	
+	// Send RequestVote to all peers
+	candidateID := serverState.SelfID
+	
 	for _, peer := range serverState.Peers {
 		if strings.TrimSpace(peer) == serverState.SelfID {
 			continue
 		}
-		go sendRequestVote(peer, serverState.CurrentTerm)
+		go sendRequestVote(peer, candidateID)
 	}
 }
 
-// sendRequestVote sends a RequestVote RPC to a given peer.
-func sendRequestVote(peer string, term uint64) {
+// Send a RequestVote RPC to a peer.
+func sendRequestVote(peer string, candidateID string) {
 	addr, err := net.ResolveUDPAddr("udp", peer)
 	if err != nil {
 		log.Printf("Failed to resolve peer address %s: %v", peer, err)
 		return
 	}
+
+	// Get last log info
+	var lastLogIndex uint64 = 0
+	var lastLogTerm uint64 = 0
+	if len(serverState.LogEntries) > 0 {
+		lastEntry := &serverState.LogEntries[len(serverState.LogEntries)-1]
+		lastLogIndex = lastEntry.Index
+		lastLogTerm = lastEntry.Term
+	}
+	term := serverState.CurrentTerm
+
 	req := &miniraft.Raft{
 		Message: &miniraft.Raft_RequestVoteRequest{
 			RequestVoteRequest: &miniraft.RequestVoteRequest{
 				Term:          term,
-				LastLogIndex:  0, // Simplified: no log entries yet.
-				LastLogTerm:   0,
-				CandidateName: serverState.SelfID,
+				LastLogIndex:  lastLogIndex,
+				LastLogTerm:   lastLogTerm,
+				CandidateName: candidateID,
 			},
 		},
 	}
@@ -325,42 +415,79 @@ func sendRequestVote(peer string, term uint64) {
 	_, err = conn.Write(data)
 	if err != nil {
 		log.Printf("Error sending RequestVote to %s: %v", peer, err)
+	} else if debugMode {
+		log.Printf("Sent RequestVote to %s for term %d", peer, term)
 	}
 }
 
-// handleRequestVote processes an incoming RequestVote RPC.
+// Process incoming RequestVote RPC.
 func handleRequestVote(req *miniraft.RequestVoteRequest, addr *net.UDPAddr) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Reject if candidate's term is less than our term.
-	if req.Term < serverState.CurrentTerm {
-		sendRequestVoteResponse(addr, false)
-		return
-	}
-
-	// If candidate's term is higher, update our term and revert to follower.
+	voteGranted := false
+	
+	// Step down if the term is higher
 	if req.Term > serverState.CurrentTerm {
+		if debugMode {
+			log.Printf("RequestVote: Stepping down from %s to follower due to higher term %d > %d", 
+				serverState.State, req.Term, serverState.CurrentTerm)
+		}
 		serverState.CurrentTerm = req.Term
 		serverState.State = "Follower"
 		serverState.VotedFor = ""
 	}
 
-	// Grant vote if we haven't voted yet or have already voted for this candidate.
-	if serverState.VotedFor == "" || serverState.VotedFor == req.CandidateName {
-		serverState.VotedFor = req.CandidateName
-		sendRequestVoteResponse(addr, true)
-	} else {
-		sendRequestVoteResponse(addr, false)
+	// Reject if candidate's term is less than self
+	if req.Term < serverState.CurrentTerm {
+		if debugMode {
+			log.Printf("RequestVote: Rejecting vote to %s - lower term %d < %d", 
+				req.CandidateName, req.Term, serverState.CurrentTerm)
+		}
+		sendRequestVoteResponse(addr, false, serverState.CurrentTerm)
+		return
 	}
+	
+	if serverState.VotedFor == "" || serverState.VotedFor == req.CandidateName {
+		// Check if candidate's log is at least as up-to-date as self
+		lastLogIndex := uint64(0)
+		lastLogTerm := uint64(0)
+		
+		if len(serverState.LogEntries) > 0 {
+			lastEntry := &serverState.LogEntries[len(serverState.LogEntries)-1]
+			lastLogIndex = lastEntry.Index
+			lastLogTerm = lastEntry.Term
+		}
+		
+		// Grant vote if candidate's log is at least as up-to-date as ours
+		// The Raft paper section 5.4.1
+		if req.LastLogTerm > lastLogTerm || 
+			(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= lastLogIndex) {
+			serverState.VotedFor = req.CandidateName
+			voteGranted = true
+			lastHeartbeat = time.Now() // Reset election timer if vote is given
+			
+			if debugMode {
+				log.Printf("RequestVote: Granting vote to %s for term %d", 
+					req.CandidateName, req.Term)
+			}
+		} else if debugMode {
+			log.Printf("RequestVote: Rejecting vote to %s - log not up-to-date", req.CandidateName)
+		}
+	} else if debugMode {
+		log.Printf("RequestVote: Already voted for %s in term %d", 
+			serverState.VotedFor, serverState.CurrentTerm)
+	}
+	
+	sendRequestVoteResponse(addr, voteGranted, serverState.CurrentTerm)
 }
 
-// sendRequestVoteResponse sends a response for a RequestVote RPC.
-func sendRequestVoteResponse(addr *net.UDPAddr, voteGranted bool) {
+// Respond to RequestVote RPC with a vote or not.
+func sendRequestVoteResponse(addr *net.UDPAddr, voteGranted bool, term uint64) {
 	resp := &miniraft.Raft{
 		Message: &miniraft.Raft_RequestVoteResponse{
 			RequestVoteResponse: &miniraft.RequestVoteResponse{
-				Term:        serverState.CurrentTerm,
+				Term:        term,
 				VoteGranted: voteGranted,
 			},
 		},
@@ -382,28 +509,53 @@ func sendRequestVoteResponse(addr *net.UDPAddr, voteGranted bool) {
 	}
 }
 
-// handleRequestVoteResponse processes a vote response.
+// Process vote response
 func handleRequestVoteResponse(resp *miniraft.RequestVoteResponse) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// If the response's term is greater, update our term and revert to follower.
+	if serverState.State != "Candidate" || resp.Term != serverState.CurrentTerm {
+		return
+	}
+
+	// If term in response is greater then update term and set state to follower
 	if resp.Term > serverState.CurrentTerm {
+		if debugMode {
+			log.Printf("Vote response: Stepping down to follower due to higher term %d > %d", 
+				resp.Term, serverState.CurrentTerm)
+		}
 		serverState.CurrentTerm = resp.Term
 		serverState.State = "Follower"
 		serverState.VotedFor = ""
 		return
 	}
-	// If we're still a candidate in the current term, count the vote.
-	if serverState.State == "Candidate" && resp.Term == serverState.CurrentTerm {
-		if resp.VoteGranted {
-			candidateVotes++
-			log.Printf("Candidate %s received vote, total votes: %d", serverState.SelfID, candidateVotes)
-			// With three nodes, majority is 2 votes.
-			if candidateVotes > len(serverState.Peers)/2 {
-				serverState.State = "Leader"
-				log.Printf("Server %s elected as Leader for term %d", serverState.SelfID, serverState.CurrentTerm)
+	
+	// Count votes
+	if resp.VoteGranted {
+		candidateVotes++
+		log.Printf("Candidate %s received vote, total votes: %d/%d", 
+			serverState.SelfID, candidateVotes, len(serverState.Peers))
+		
+		// Check if more than half voted for self
+		if candidateVotes > len(serverState.Peers)/2 {
+			log.Printf("Server %s elected as Leader for term %d", 
+				serverState.SelfID, serverState.CurrentTerm)
+			
+			// Set state to leader
+			serverState.State = "Leader"
+			
+			// Reset the indexes
+			for peer := range serverState.NextIndex {
+				lastLogIndex := uint64(1)
+				if len(serverState.LogEntries) > 0 {
+					lastLogIndex = serverState.LogEntries[len(serverState.LogEntries)-1].Index + 1
+				}
+				serverState.NextIndex[peer] = lastLogIndex
+				serverState.MatchIndex[peer] = 0
 			}
+			
+			// Start sending heartbeats
+			go sendHeartbeats()
 		}
 	}
 }
@@ -411,6 +563,12 @@ func handleRequestVoteResponse(resp *miniraft.RequestVoteResponse) {
 // sendHeartbeats sends an AppendEntries (heartbeat) RPC to all peers.
 func sendHeartbeats() {
 	mu.Lock()
+	// Double check leader status
+	if serverState.State != "Leader" {
+		mu.Unlock()
+		return
+	}
+	
 	term := serverState.CurrentTerm
 	leaderID := serverState.SelfID
 	commitIndex := serverState.CommitIndex
@@ -420,59 +578,381 @@ func sendHeartbeats() {
 		if strings.TrimSpace(peer) == leaderID {
 			continue
 		}
-		go func(peer string) {
-			addr, err := net.ResolveUDPAddr("udp", peer)
-			if err != nil {
-				log.Printf("Failed to resolve peer address %s: %v", peer, err)
-				return
-			}
-			req := &miniraft.Raft{
-				Message: &miniraft.Raft_AppendEntriesRequest{
-					AppendEntriesRequest: &miniraft.AppendEntriesRequest{
-						Term:         term,
-						PrevLogIndex: 0,
-						PrevLogTerm:  0,
-						LeaderCommit: commitIndex,
-						LeaderId:     leaderID,
-						Entries:      []*miniraft.LogEntry{}, // empty heartbeat
-					},
-				},
-			}
-			data, err := proto.Marshal(req)
-			if err != nil {
-				log.Printf("Error marshaling heartbeat: %v", err)
-				return
-			}
-			conn, err := net.DialUDP("udp", nil, addr)
-			if err != nil {
-				log.Printf("Failed to dial peer %s: %v", peer, err)
-				return
-			}
-			defer conn.Close()
-			_, err = conn.Write(data)
-			if err != nil {
-				log.Printf("Error sending heartbeat to %s: %v", peer, err)
-			}
-		}(peer)
+		go sendAppendEntries(peer, term, leaderID, commitIndex)
 	}
 }
 
-// handleAppendEntries processes an AppendEntries (heartbeat) RPC.
-func handleAppendEntries(req *miniraft.AppendEntriesRequest, addr *net.UDPAddr) {
+// Send AppendEntries RPC to a peer
+func sendAppendEntries(peer string, term uint64, leaderID string, commitIndex uint64) {
 	mu.Lock()
-	defer mu.Unlock()
-
-	// Ignore if the leader's term is less than our term.
-	if req.Term < serverState.CurrentTerm {
+	// Find what is the next log index for this peer
+	nextIdx := serverState.NextIndex[peer]
+	prevLogIndex := nextIdx - 1
+	prevLogTerm := uint64(0)
+	
+	// Find the term of the previous log entry
+	if prevLogIndex > 0 && int(prevLogIndex-1) < len(serverState.LogEntries) {
+		prevLogTerm = serverState.LogEntries[prevLogIndex-1].Term
+	}
+	
+	// Get entries to send (empty for heartbeat)
+	var entries []*miniraft.LogEntry
+	// For actual log replication (not just heartbeat)
+	if nextIdx <= uint64(len(serverState.LogEntries)) {
+		// Send log entries starting at nextIndex (The Raft paper section 5.3)
+		for i := nextIdx - 1; i < uint64(len(serverState.LogEntries)); i++ {
+			entry := &serverState.LogEntries[i]
+			entries = append(entries, &miniraft.LogEntry{
+				Index:       entry.Index,
+				Term:        entry.Term,
+				CommandName: entry.CommandName,
+			})
+		}
+	}
+	mu.Unlock()
+	
+	// Create the AppendEntries request
+	req := &miniraft.Raft{
+		Message: &miniraft.Raft_AppendEntriesRequest{
+			AppendEntriesRequest: &miniraft.AppendEntriesRequest{
+				Term:         term,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				LeaderCommit: commitIndex,
+				LeaderId:     leaderID,
+				Entries:      entries,
+			},
+		},
+	}
+	
+	// Send the request
+	addr, err := net.ResolveUDPAddr("udp", peer)
+	if err != nil {
+		log.Printf("Failed to resolve peer address %s: %v", peer, err)
 		return
 	}
-	// If leader's term is higher, update our term and revert to follower.
-	if req.Term > serverState.CurrentTerm {
-		serverState.CurrentTerm = req.Term
+	
+	data, err := proto.Marshal(req)
+	if err != nil {
+		log.Printf("Error marshaling AppendEntries: %v", err)
+		return
+	}
+	
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		log.Printf("Failed to dial peer %s: %v", peer, err)
+		return
+	}
+	defer conn.Close()
+	
+	_, err = conn.Write(data)
+	if err != nil {
+		log.Printf("Error sending AppendEntries to %s: %v", peer, err)
+	} else if len(entries) > 0 && debugMode {
+		log.Printf("Sent %d log entries to %s", len(entries), peer)
+	}
+}
+
+// Process an AppendEntries RPC.
+func handleAppendEntries(req *miniraft.AppendEntriesRequest, addr *net.UDPAddr) {
+	mu.Lock()
+	
+	// Create response (default to failure)
+	success := false
+	responseTerm := serverState.CurrentTerm
+	
+	// Reject if leaders term is less than self
+	if req.Term < serverState.CurrentTerm {
+		if debugMode {
+			log.Printf("AppendEntries: Rejecting from %s - lower term %d < %d", 
+				req.LeaderId, req.Term, serverState.CurrentTerm)
+		}
+		mu.Unlock()
+		sendAppendEntriesResponse(addr, false, serverState.CurrentTerm)
+		return
+	}
+	
+	// If term is greater or equal, update state to follower
+	if req.Term >= serverState.CurrentTerm {
+		wasLeader := serverState.State == "Leader"
+		if req.Term > serverState.CurrentTerm || serverState.State != "Follower" {
+			if debugMode && (wasLeader || serverState.State == "Candidate") {
+				log.Printf("AppendEntries: %s stepping down to follower due to term %d >= %d", 
+					serverState.State, req.Term, serverState.CurrentTerm)
+			}
+			serverState.CurrentTerm = req.Term
+			serverState.State = "Follower"
+			serverState.VotedFor = ""
+		}
+		lastHeartbeat = time.Now()
+	}
+	
+	// Check if the leader is up-to-date
+	if len(req.Entries) > 0 {
+		logOK := false
+		
+		if req.PrevLogIndex == 0 {
+			logOK = true
+		} else if int(req.PrevLogIndex-1) < len(serverState.LogEntries) {
+			// Check if terms match at prevLogIndex
+			if serverState.LogEntries[req.PrevLogIndex-1].Term == req.PrevLogTerm {
+				logOK = true
+			}
+		}
+		
+		if !logOK {
+			// Log inconsistency, reject
+			// The Raft paper section 5.3
+			if debugMode {
+				log.Printf("AppendEntries: Log inconsistency at index %d", req.PrevLogIndex)
+			}
+			mu.Unlock()
+			sendAppendEntriesResponse(addr, false, serverState.CurrentTerm)
+			return
+		}
+		
+		// Process log entries
+		for i, entry := range req.Entries {
+			entryIndex := req.PrevLogIndex + uint64(i) + 1
+			
+			// If existing entry conflicts with new one (same index, different terms)
+			if int(entryIndex-1) < len(serverState.LogEntries) {
+				if serverState.LogEntries[entryIndex-1].Term != entry.Term {
+					// Delete it and all following entries
+					serverState.LogEntries = serverState.LogEntries[:entryIndex-1]
+				} else {
+					// Skip entry if already present with same term
+					continue
+				}
+			}
+			
+			// Append new entry if we reach here
+			if int(entryIndex-1) >= len(serverState.LogEntries) {
+				serverState.LogEntries = append(serverState.LogEntries, miniraft.LogEntry{
+					Index:       entry.Index,
+					Term:        entry.Term,
+					CommandName: entry.CommandName,
+				})
+				if debugMode {
+					log.Printf("AppendEntries: Added entry %d: %s", 
+						entry.Index, entry.CommandName)
+				}
+			}
+		}
+		
+		// Success for log entries
+		success = true
+	} else {
+		// Empty AppendEntries is just a heartbeat
+		success = true
+	}
+	
+	// Update commit index if leaders is higher
+	if req.LeaderCommit > serverState.CommitIndex {
+		lastLogIndex := uint64(0)
+		if len(serverState.LogEntries) > 0 {
+			lastLogIndex = serverState.LogEntries[len(serverState.LogEntries)-1].Index
+		}
+		
+		// Set commit index
+		if req.LeaderCommit < lastLogIndex {
+			serverState.CommitIndex = req.LeaderCommit
+		} else {
+			serverState.CommitIndex = lastLogIndex
+		}
+		
+		if debugMode {
+			log.Printf("AppendEntries: Updated commit index to %d", serverState.CommitIndex)
+		}
+		
+		// Apply committed entries
+		applyCommittedEntries()
+	}
+	
+	mu.Unlock()
+	
+	// Send response
+	sendAppendEntriesResponse(addr, success, responseTerm)
+}
+
+// Response to AppendEntries
+func sendAppendEntriesResponse(addr *net.UDPAddr, success bool, term uint64) {
+	resp := &miniraft.Raft{
+		Message: &miniraft.Raft_AppendEntriesResponse{
+			AppendEntriesResponse: &miniraft.AppendEntriesResponse{
+				Term:    term,
+				Success: success,
+			},
+		},
+	}
+	
+	data, err := proto.Marshal(resp)
+	if err != nil {
+		log.Printf("Error marshaling AppendEntriesResponse: %v", err)
+		return
+	}
+	
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		log.Printf("Error dialing for AppendEntriesResponse: %v", err)
+		return
+	}
+	defer conn.Close()
+	
+	_, err = conn.Write(data)
+	if err != nil {
+		log.Printf("Error sending AppendEntriesResponse: %v", err)
+	}
+}
+
+// Process responses to AppendEntries RPC
+func handleAppendEntriesResponse(resp *miniraft.AppendEntriesResponse, addr *net.UDPAddr) {
+	mu.Lock()
+	defer mu.Unlock()
+	
+	// Ignore if not a leader anymore
+	if serverState.State != "Leader" {
+		return
+	}
+	
+	// If term in response is greater than self - update term and set state to follower
+	if resp.Term > serverState.CurrentTerm {
+		if debugMode {
+			log.Printf("AppendEntries response: Stepping down to follower due to higher term %d > %d", 
+				resp.Term, serverState.CurrentTerm)
+		}
+		serverState.CurrentTerm = resp.Term
 		serverState.State = "Follower"
 		serverState.VotedFor = ""
+		return
 	}
-	// Reset our heartbeat timer.
-	lastHeartbeat = time.Now()
-	log.Printf("Received heartbeat from leader %s", req.LeaderId)
+	
+	// Find the peer that responded
+	peerAddr := addr.String()
+	var peerID string
+	for _, peer := range serverState.Peers {
+		if strings.HasPrefix(peer, peerAddr) || strings.HasSuffix(peer, peerAddr) {
+			peerID = peer
+			break
+		}
+	}
+	
+	if peerID == "" {
+		log.Printf("AppendEntries response: Could not identify peer from %s", addr.String())
+		return
+	}
+	
+	// If append was successful, update nextIndex and matchIndex
+	if resp.Success {
+		// Determine the index of the last log entry sent to this peer
+		nextIndex := serverState.NextIndex[peerID]
+		lastSentIndex := nextIndex - 1
+		for i := lastSentIndex + 1; i <= uint64(len(serverState.LogEntries)); i++ {
+			if int(i-1) < len(serverState.LogEntries) {
+				lastSentIndex = i
+			}
+		}
+		
+		// Update indexes for peer
+		if lastSentIndex >= serverState.NextIndex[peerID] {
+			if debugMode {
+				log.Printf("AppendEntries response: Peer %s successfully replicated up to index %d", 
+					peerID, lastSentIndex)
+			}
+			serverState.NextIndex[peerID] = lastSentIndex + 1
+			serverState.MatchIndex[peerID] = lastSentIndex
+			
+			// Commit new entries
+			updateCommitIndex()
+		}
+	} else {
+		// If failed due to log inconsistency, decrement nextIndex and retry
+		if serverState.NextIndex[peerID] > 1 {
+			serverState.NextIndex[peerID]--
+			if debugMode {
+				log.Printf("AppendEntries response: Peer %s rejected append, decreasing nextIndex to %d", 
+					peerID, serverState.NextIndex[peerID])
+			}
+			// Will be retried on next heartbeat automatically
+		}
+	}
+}
+
+// Check if there are new entries that can be committed
+func updateCommitIndex() {
+	// Leader only commits entries from its current term
+	// Section 5.4.2 in Raft paper
+	for N := serverState.CommitIndex + 1; N <= uint64(len(serverState.LogEntries)); N++ {
+		// Check if this is from current term
+		if int(N-1) < len(serverState.LogEntries) && 
+		   serverState.LogEntries[N-1].Term == serverState.CurrentTerm {
+			
+			// Count replications
+			replicationCount := 1 // Count self
+			for peer, matchIdx := range serverState.MatchIndex {
+				if peer != serverState.SelfID && matchIdx >= N {
+					replicationCount++
+				}
+			}
+			
+			// If majority, commit entry
+			if replicationCount > len(serverState.Peers)/2 {
+				if debugMode {
+					log.Printf("Leader %s: Committing entry at index %d (replicated on %d/%d servers)", 
+						serverState.SelfID, N, replicationCount, len(serverState.Peers)) 
+				}
+				serverState.CommitIndex = N
+			} else {
+				break
+			}
+		}
+	}
+	
+	// Apply committed entries
+	applyCommittedEntries()
+}
+
+// Apply commited entries to state
+func applyCommittedEntries() {
+	// Apply all entries between lastApplied and commitIndex
+	for i := serverState.LastApplied + 1; i <= serverState.CommitIndex; i++ {
+		if int(i-1) < len(serverState.LogEntries) {
+			entry := &serverState.LogEntries[i-1]
+			
+			log.Printf("Applying command: %s (index %d, term %d)", 
+				entry.CommandName, entry.Index, entry.Term)
+			
+			// Update lastApplied
+			serverState.LastApplied = i
+		}
+	}
+}
+
+// Process client commands
+func handleClientCommand(command string) {
+	mu.Lock()
+	defer mu.Unlock()
+	
+	log.Printf("Received client command: %s", command)
+	
+	// Create a new log entry
+	newIndex := uint64(1)
+	if len(serverState.LogEntries) > 0 {
+		newIndex = serverState.LogEntries[len(serverState.LogEntries)-1].Index + 1
+	}
+	
+	newEntry := miniraft.LogEntry{
+		Index:       newIndex,
+		Term:        serverState.CurrentTerm,
+		CommandName: command,
+	}
+	
+	// Append to leader's log
+	serverState.LogEntries = append(serverState.LogEntries, newEntry)
+	log.Printf("Leader %s: Added new command to log at index %d, term %d", 
+		serverState.SelfID, newIndex, serverState.CurrentTerm)
+		
+	// The entry will be replicated to followers in the next AppendEntries cycle
+	// Force an immediate AppendEntries to replicate faster
+	go sendHeartbeats()
 }

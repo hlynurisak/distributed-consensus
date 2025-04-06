@@ -26,11 +26,12 @@ type ServerState struct {
 	LogEntries  []miniraft.LogEntry
 	State       string // "Follower", "Candidate", "Leader", "Failed"
 	
-	// Additional fields for tracking peers
+	// To track peers
 	NextIndex   map[string]uint64
 	MatchIndex  map[string]uint64
 }
 
+// Global variables
 var (
 	serverState       ServerState
 	mu                sync.Mutex
@@ -147,7 +148,8 @@ func main() {
 	}
 }
 
-// loadServerConfig reads the configuration file.
+// Parse and load the config file.
+// https://stackoverflow.com/questions/8757389/reading-a-file-line-by-line-in-go
 func loadServerConfig(filename string) ([]string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -168,7 +170,7 @@ func loadServerConfig(filename string) ([]string, error) {
 	return servers, nil
 }
 
-// contains checks if an item is in a slice.
+// Check if an item is in a slice.
 func contains(slice []string, item string) bool {
 	for _, s := range slice {
 		if strings.TrimSpace(s) == strings.TrimSpace(item) {
@@ -185,12 +187,13 @@ func initServerState(selfID string, peers []string) {
 	
 	// Initialize next and match indices for leader state
 	nextIndex := make(map[string]uint64)
+	// The highest index known to be commited
 	matchIndex := make(map[string]uint64)
 	
 	for _, peer := range peers {
 		if peer != selfID {
-			nextIndex[peer] = 1  // Start at 1 (will be sent after leader election)
-			matchIndex[peer] = 0 // Initialize at 0
+			nextIndex[peer] = 1  // Raft indexing starts at 1
+			matchIndex[peer] = 0
 		}
 	}
 	
@@ -210,8 +213,9 @@ func initServerState(selfID string, peers []string) {
 	log.Println("Server state initialized.")
 }
 
-// handleUDPMessages listens for incoming UDP packets.
+// Listen for incoming UDP packets.
 func handleUDPMessages(conn *net.UDPConn) {
+	// 64kB buffer
 	buffer := make([]byte, 65536)
 	for {
 		n, addr, err := conn.ReadFromUDP(buffer)
@@ -255,7 +259,7 @@ func handleUDPMessages(conn *net.UDPConn) {
 	}
 }
 
-// connectToPeers sends an initial handshake to each peer.
+// Send a handshake to each peer in the network.
 func connectToPeers(peers []string, selfID string) {
 	for _, peer := range peers {
 		if strings.TrimSpace(peer) == strings.TrimSpace(selfID) {
@@ -281,7 +285,7 @@ func connectToPeers(peers []string, selfID string) {
 	}
 }
 
-// runRaftProtocol handles election timeouts and heartbeat sending.
+// The main loop. Handles election timeouts and sending out the heartbeats.
 func runRaftProtocol() {
 	// Get initial randomized election timeout
 	electionTimeout := getRandomElectionTimeout()
@@ -289,26 +293,26 @@ func runRaftProtocol() {
 	for {
 		mu.Lock()
 		state := serverState.State
-		timeSinceHB := time.Since(lastHeartbeat)
+		timeSinceLast := time.Since(lastHeartbeat)
 		mu.Unlock()
 
 		switch state {
 		case "Follower":
-			// Follower: If no heartbeat received within the timeout, start an election.
-			if timeSinceHB >= electionTimeout {
+			// If no heartbeat received within the timeout, start an election.
+			if timeSinceLast >= electionTimeout {
 				mu.Lock()
 				if debugMode {
 					log.Printf("Follower %s timed out after %v, starting election", 
-						serverState.SelfID, timeSinceHB)
+						serverState.SelfID, timeSinceLast)
 				}
 				startElection()
 				electionStartTime = time.Now()
 				mu.Unlock()
 				
-				// Choose a new randomized timeout for next cycle
-				electionTimeout = getRandomElectionTimeout()
 			}
-			time.Sleep(10 * time.Millisecond) // Small sleep to prevent CPU spinning
+			// Get new random timeout for next cycle and sleep a little
+			electionTimeout = getRandomElectionTimeout()
+			time.Sleep(10 * time.Millisecond)
 			
 		case "Candidate":
 			// Candidate: Timeout if election takes too long
@@ -322,9 +326,9 @@ func runRaftProtocol() {
 				electionStartTime = time.Now()
 				mu.Unlock()
 				
-				// Choose a new randomized timeout for next cycle
-				electionTimeout = getRandomElectionTimeout()
 			}
+			// Choose a new randomized timeout for next cycle
+			electionTimeout = getRandomElectionTimeout()
 			time.Sleep(10 * time.Millisecond)
 			
 		case "Leader":
@@ -342,18 +346,19 @@ func runRaftProtocol() {
 	}
 }
 
-// getRandomElectionTimeout returns a random election timeout between min and max values
+// Get a random election timeout within the specified min and max timeouts.
 func getRandomElectionTimeout() time.Duration {
 	return minElectionTimeout + time.Duration(rand.Int63n(int64(maxElectionTimeout-minElectionTimeout)))
 }
 
-// startElection sets our state to Candidate, increments term, votes for self,
-// and sends RequestVote RPCs to all peers.
+// startElection sets state to Candidate, increments term, votes for self 
+// and ask the others to vote for me aswell (RequestVote RPC).
 func startElection() {
 	serverState.State = "Candidate"
 	serverState.CurrentTerm++
 	serverState.VotedFor = serverState.SelfID
-	candidateVotes = 1 // Vote for self.
+	candidateVotes = 1 // 1 vote from self
+	lastHeartbeat = time.Now() // Reset heartbeat timer
 	log.Printf("Starting election for term %d", serverState.CurrentTerm)
 	
 	// Get last log info
